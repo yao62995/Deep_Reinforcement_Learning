@@ -1,6 +1,6 @@
 #!/usr/bin/python
 #  -*- coding: utf-8 -*-
-# author:  <yao62995@gmail.com> 
+# author: yao62995@gmail.com
 
 import os
 import time
@@ -104,6 +104,11 @@ class NetTools(object):
     @staticmethod
     def avg_pool(x, ksize=2, stride=2, padding="SAME", name=None):
         return tf.nn.avg_pool(x, ksize=[1, ksize, ksize, 1], strides=[1, stride, stride, 1], padding=padding, name=name)
+
+    @staticmethod
+    def batch_normalized(x, mean=0.0, var=1.0, offset=None, scale=None, epsilon=1e-10, name=None):
+        return tf.nn.batch_normalization(x, mean=mean, variance=var, offset=offset, scale=scale,
+                                         variance_epsilon=epsilon, name=name)
 
     @staticmethod
     def full_connect(x, W_shape, variable_scope, stddev=0.04, activate="relu", weight_decay=None, with_param=False):
@@ -214,6 +219,7 @@ class Base(object):
         :return: None
         """
         return
+
 
 
 # define logger
