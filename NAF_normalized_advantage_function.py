@@ -7,6 +7,9 @@ from collections import deque
 
 from common import *
 
+# from tensorflow.python.framework import ops
+# @ops.RegisterGradient("norm_adv")
+# def normalized_advantange(op, grad, some_other_arg):
 
 class NAF(Base):
     """
@@ -71,30 +74,32 @@ class NAF(Base):
             h2_w, h2_b = self.get_variables("fc2", (dim, dim), wd=wd, collect=scope)
             h3_w, h3_b = self.get_variables("fc3", (dim, dim), wd=wd, collect=scope)
             # value variable
-            v_w, v_b = self.get_variables("fc3", (dim, 1), val_range=(-3e-4, 3e-4), wd=wd, collect=scope)
+            v_w, v_b = self.get_variables("fc_v", (dim, 1), val_range=(-3e-4, 3e-4), wd=wd, collect=scope)
             # μ variable
-            mu_w, mu_b = self.get_variables("fc3", (dim, 1), val_range=(-3e-4, 3e-4), wd=wd, collect=scope)
+            mu_w, mu_b = self.get_variables("fc_mu", (dim, self.actions_dim), val_range=(-3e-4, 3e-4), wd=wd, collect=scope)
             # lower-triangular matrix
-            l_w, l_b = self.get_variables("fc3", (dim, self.actions_dim * (self.actions_dim + 1)),
+            l_w, l_b = self.get_variables("fc_l", (dim, self.actions_dim * (self.actions_dim + 1) / 2),
                                           val_range=(-3e-4, 3e-4), wd=wd, collect=scope)
             return [h1_w, h1_b, h2_w, h2_b, h3_w, h3_b,
                     v_w, v_b, mu_w, mu_b, l_w, l_b]
 
     def lower_triangular(self, x, n):
         """
-        :param x: a tensor with shape (batch_size, n*(n+1))
+        :param x: a tensor with shape (batch_size, n*(n+1)/2)
         :return: a tensor of lower-triangular with shape (batch_size, n, n)
         """
         x = tf.transpose(x, perm=(1, 0))
-        target = tf.Variable(np.zeros((n * n, self.batch_size)))
+        # target = tf.Variable(np.zeros((n * n, self.batch_size)), dtype=tf.float32)
+        target = tf.Variable(np.zeros((n * n, self.batch_size)), dtype=tf.float32)
         # update diagonal values
         diag_indics = tf.square(tf.range(n))
-        target = tf.scatter_update(target, diag_indics, x[:n, :])
+        t1 = tf.stop_gradient(tf.scatter_update(target, diag_indics, x[:n, :]))
         # update lower values
         u, v = np.tril_indices(n, -1)
         lower_indics = tf.constant(u * n + v)
-        target = tf.scatter_update(target, lower_indics, x[n:, :])
+        t2 = tf.stop_gradient(tf.scatter_update(target, lower_indics, x[n:, :]))
         # reshape lower matrix to lower-triangular matrix
+        target = tf.add(t1, t2)
         target = tf.transpose(target, (1, 0))
         target = tf.reshape(target, (self.batch_size, n, n))
         return target
@@ -102,7 +107,7 @@ class NAF(Base):
     def inference(self, op_scope, state, action, theta, batch_norm=True):
         h1_w, h1_b, h2_w, h2_b, h3_w, h3_b = theta[:6]
         v_w, v_b, mu_w, mu_b, l_w, l_b = theta[6:]
-        with tf.variable_op_scope(op_scope):
+        with tf.variable_op_scope([state, action], op_scope, "naf"):
             # full connect layers
             fc1 = tf.nn.relu(tf.matmul(state, h1_w) + h1_b)
             if batch_norm:
@@ -120,11 +125,12 @@ class NAF(Base):
             # transform (batch_size, n*(n+1)) to (batch_size, n, n) with low_triangular format
             l1_var = self.lower_triangular(h_l, self.actions_dim)
             # Advantage layer: step_3 - positive-definite square matrix
-            p_var = tf.matmul(l1_var, tf.transpose(l1_var, perm=[2, 1]))
+            p_var = tf.batch_matmul(l1_var, tf.transpose(l1_var, perm=[0, 2, 1]))
             diff_u = tf.reshape(action - h_mu, (-1, 1, self.actions_dim))
             # a_var = (diff_u * p_val * diff_u.T)
-            a_var = tf.matmul(tf.matmul(diff_u, p_var), tf.transpose(diff_u, perm=[2, 1]))
-            q = tf.add(h_v + a_var)
+            a_var = tf.batch_matmul(tf.batch_matmul(diff_u, p_var), tf.transpose(diff_u, perm=[0, 2, 1]))
+            a_var = tf.squeeze(a_var, [1], name='advantage')
+            q = tf.add(h_v, a_var)
             return h_mu, h_v, q
 
     def build_graph(self, dim=256):
@@ -138,18 +144,18 @@ class NAF(Base):
             state = tf.placeholder(tf.float32, shape=(None, self.states_dim), name="state")
             action = tf.placeholder(tf.float32, shape=(None, self.actions_dim), name="action")
             q_target = tf.placeholder(tf.float32, shape=(None), name="q_target")
-            mu, v, q = self.inference(state, action)
+            mu, v, q = self.inference("network", state, action, theta_q)
             # target network
             state_t = tf.placeholder(tf.float32, shape=(None, self.states_dim), name="state_t")
             action_t = tf.placeholder(tf.float32, shape=(None, self.actions_dim), name="action_t")
-            mu_t, v_t, q_t = self.inference(state, action)
+            mu_t, v_t, q_t = self.inference("target_network", state_t, action_t, theta_qt)
             # loss
             l2_loss = tf.add_n(tf.get_collection("naf"))
             q_loss = tf.reduce_mean(tf.square(q - q_target)) + l2_loss
             # optimizer
             opt = tf.train.AdamOptimizer(self.learn_rate).minimize(q_loss, global_step=self.global_step)
             with tf.control_dependencies([opt]):
-                train_q = tf.group([update_qt])
+                train_q = tf.group(update_qt)
             # init session and saver
             self.saver = tf.train.Saver()
             self.sess = tf.Session(config=tf.ConfigProto(
@@ -160,13 +166,13 @@ class NAF(Base):
         # restore model
         restore_model(self.sess, self.train_dir, self.saver)
         self.ops["act_logit"] = lambda obs: self.sess.run(mu, feed_dict={state: obs})
-        self.ops["target_q"] = lambda obs, act: self.sess.run(q_t, feed_dict={state_t: obs, action_t: act})
+        self.ops["target_value"] = lambda obs: self.sess.run(v_t, feed_dict={state_t: obs})
         self.ops["train_q"] = lambda obs, act, q_val: self.sess.run([train_q, self.global_step, q_loss],
                                                                     feed_dict={state: obs, action: act,
                                                                                q_target: q_val})
 
     def get_action(self, state, with_noise=False):
-        action = self.ops["act_logit"]([state])[0][0]
+        action = self.ops["act_logit"]([state])[0]
         if with_noise:
             action = action + self.explore_noise.noise()
         return action
@@ -180,19 +186,18 @@ class NAF(Base):
             for _ in xrange(self.train_repeat):
                 # train mini-batch from replay memory
                 mini_batch = random.sample(self.replay_memory, self.batch_size)
-                batch_state, batch_action = [], []
-                batch_target_q = []
+                batch_state = [sample[0] for sample in mini_batch]
+                batch_action = [sample[1] for sample in mini_batch]
+                batch_state_n = [sample[4] for sample in mini_batch]
+                batch_target_value = self.ops["target_value"](batch_state_n)
                 for batch_i, sample in enumerate(mini_batch):
-                    b_state, b_action, b_reward, b_terminal, b_state_n = sample
+                    b_reward, b_terminal = sample[2], sample[3]
                     if b_terminal:
-                        target_q = b_reward
+                        batch_target_value[batch_i] = b_reward
                     else:  # compute target q values
-                        target_q = b_reward + self.gamma * self.ops["target_q"]([b_state_n])[0][0]
-                    batch_state.append(b_state)
-                    batch_action.append(b_action)
-                    batch_target_q.append(target_q)
+                        batch_target_value[batch_i] = b_reward + self.gamma * [0][0]
                 # update critic network (theta_q)
-                _, global_step, q_loss = self.ops["train_q"](batch_state, batch_action, batch_target_q)
+                _, global_step, q_loss = self.ops["train_q"](batch_state, batch_action, batch_target_value)
                 if self.time_step % 1e3 == 0:
                     # logger.info("step=%d, p_loss=%.6f, q_loss=%.6f" % (global_step, p_loss, q_loss))
                     logger.info("step=%d, q_loss=%.6f" % (global_step, q_loss))
